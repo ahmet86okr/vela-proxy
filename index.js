@@ -47,34 +47,57 @@ server.on('upgrade', (req, socket, head) => {
   if (req.headers.authorization) headers.authorization = req.headers.authorization;
   const upstream = new WebSocket(`${WS_TARGET}${req.url}`, { headers });
 
-  const pending = [];
-  let opened = false;
+  const upstreamPending = [];
+  let clientReady = null;
+  let upgraded = false;
 
-  upstream.on('unexpected-response', (_r, upRes) => {
-    socket.write(`HTTP/1.1 ${upRes.statusCode} ${upRes.statusMessage}\r\nConnection: close\r\n\r\n`);
-    socket.destroy();
+  upstream.on('message', (data, isBinary) => {
+    if (clientReady && clientReady.readyState === 1) {
+      clientReady.send(data, { binary: isBinary });
+    } else {
+      upstreamPending.push([data, isBinary]);
+    }
   });
 
-  upstream.on('error', () => socket.destroy());
+  upstream.on('unexpected-response', (_r, upRes) => {
+    if (!upgraded && !socket.destroyed) {
+      socket.write(`HTTP/1.1 ${upRes.statusCode} ${upRes.statusMessage}\r\nConnection: close\r\n\r\n`);
+      socket.destroy();
+    }
+  });
 
-  wss.handleUpgrade(req, socket, head, (client) => {
-    client.on('message', (data, isBinary) => {
-      if (opened) upstream.send(data, { binary: isBinary });
-      else pending.push([data, isBinary]);
-    });
-    client.on('close', (code, reason) => {
-      if (upstream.readyState <= 1) upstream.close(code >= 1000 && code < 5000 ? code : 1000, reason?.toString());
-    });
-    upstream.on('open', () => {
-      opened = true;
-      for (const [d, b] of pending) upstream.send(d, { binary: b });
-      pending.length = 0;
-    });
-    upstream.on('message', (data, isBinary) => {
-      if (client.readyState === 1) client.send(data, { binary: isBinary });
-    });
-    upstream.on('close', (code, reason) => {
-      if (client.readyState <= 1) client.close(code >= 1000 && code < 5000 ? code : 1000, reason?.toString());
+  upstream.on('error', () => {
+    if (clientReady && clientReady.readyState <= 1) clientReady.close(1011, 'upstream_error');
+    else if (!socket.destroyed) socket.destroy();
+  });
+
+  upstream.on('close', (code, reason) => {
+    if (clientReady && clientReady.readyState <= 1) {
+      clientReady.close(code >= 1000 && code < 5000 ? code : 1000, reason?.toString());
+    } else if (!upgraded && !socket.destroyed) {
+      socket.destroy();
+    }
+  });
+
+  upstream.on('open', () => {
+    upgraded = true;
+    wss.handleUpgrade(req, socket, head, (client) => {
+      clientReady = client;
+      for (const [d, b] of upstreamPending) {
+        if (client.readyState === 1) client.send(d, { binary: b });
+      }
+      upstreamPending.length = 0;
+      client.on('message', (data, isBinary) => {
+        if (upstream.readyState === 1) upstream.send(data, { binary: isBinary });
+      });
+      client.on('close', (code, reason) => {
+        if (upstream.readyState <= 1) {
+          upstream.close(code >= 1000 && code < 5000 ? code : 1000, reason?.toString());
+        }
+      });
+      client.on('error', () => {
+        if (upstream.readyState <= 1) upstream.close(1011, 'client_error');
+      });
     });
   });
 });
